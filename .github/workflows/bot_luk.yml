@@ -40,7 +40,7 @@ concurrency:
 jobs:
   bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 100
+    timeout-minutes: 75
     env:
       # Secretos propios del bot Luk; si no existen, usa los genéricos APCA_*
       APCA_API_KEY_ID: ${{ secrets.API_KEY_LUK || secrets.APCA_API_KEY_ID }}
@@ -51,9 +51,11 @@ jobs:
       PROGRAMADO: ${{ github.event_name == 'schedule' && 'true' || 'false' }}
       SCHED: ${{ github.event.schedule }}
       MODO_MANUAL: ${{ github.event.inputs.modo }}
+      # Hora NY hasta la que el monitor vigila entradas (cada minuto de más gasta minutos de Actions).
+      # Se puede cambiar sin tocar el archivo: variable del repo ENTRADA_HASTA (p. ej. 10:15).
+      ENTRADA_HASTA: ${{ vars.ENTRADA_HASTA || '10:30' }}
       # Parámetros opcionales (descomenta para cambiarlos)
       # RIESGO_PCT: '0.005'
-      # ENTRADA_HASTA: '11:00'
       # MANTENER_NOCHE: 'false'
       # FEED_DIARIO: 'sip'
       # FEED_INTRA: 'iex'
