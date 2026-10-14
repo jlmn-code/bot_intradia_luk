@@ -18,6 +18,7 @@ Todo se configura con variables de entorno (ver bloque CONFIG).
 import json
 import math
 import os
+import re
 import sys
 import time
 from datetime import date, datetime, time as dtime, timedelta
@@ -65,6 +66,11 @@ RET_6M_MIN = _f("RET_6M_MIN", 0.30)
 RANK_TOP = _f("RANK_TOP", 0.30)                  # top 30 % de retorno a 3M entre acciones líquidas
 ATR_CONTRACCION = _f("ATR_CONTRACCION", 0.95)    # ATR% actual <= 0.95 * ATR% de hace 10 sesiones
 MAX_WATCHLIST = _i("MAX_WATCHLIST", 15)
+MAX_EXT_EMA21 = _f("MAX_EXT_EMA21", 0.08)        # precio <= EMA21 * 1.08 (no comprar valores muy extendidos)
+ANCLA_MIN_SESIONES = _i("ANCLA_MIN_SESIONES", 5) # el máximo ancla debe tener >= 5 sesiones (hay consolidación)
+MAX_CORR = _f("MAX_CORR", 0.80)                  # correlación (60 sesiones) para considerar "mismo tema"
+MAX_POR_GRUPO = _i("MAX_POR_GRUPO", 2)           # máx. valores correlacionados en la watchlist
+EXCLUIR_ETF = _b("EXCLUIR_ETF", True)            # fuera ETFs/ETNs y apalancados (por nombre)
 ANCLA_DIAS = _i("ANCLA_DIAS", 20)                # el AVWAP se ancla al máximo de las últimas N sesiones
 FEED_DIARIO = DataFeed(os.getenv("FEED_DIARIO", "sip").lower())
 FEED_INTRA = DataFeed(os.getenv("FEED_INTRA", "iex").lower())
@@ -204,9 +210,12 @@ def universo(trading) -> list:
     activos = reintentar(lambda: trading.get_all_assets(
         GetAssetsRequest(status=AssetStatus.ACTIVE, asset_class=AssetClass.US_EQUITY)))
     bolsas = {"NASDAQ", "NYSE", "AMEX", "ARCA"}
+    etf = re.compile(r"\b(ETF|ETN|2X|3X|DAILY|LEVERAGED|INVERSE|FUND)\b", re.I)
     s = []
     for a in activos:
         ex = getattr(a.exchange, "value", a.exchange)
+        if EXCLUIR_ETF and etf.search(a.name or ""):
+            continue
         if a.tradable and str(ex) in bolsas and a.symbol.isalpha() and len(a.symbol) <= 5:
             s.append(a.symbol)
     log(f"Universo desde Alpaca: {len(s)} tickers")
@@ -241,6 +250,8 @@ def metricas(df: pd.DataFrame):
         "atr_pct_prev": float(atr.iloc[-11] / c.iloc[-11]),
         "higher_lows": bool((m3 >= m2 * 0.99) and (m2 >= m1 * 0.99)),
         "ancla_fecha": ventana["high"].idxmax().date().isoformat(),
+        "ancla_sesiones": int(len(ventana) - 1 - ventana.index.get_loc(ventana["high"].idxmax())),
+        "dist_ema21": float(precio / ema21.iloc[-1] - 1),
         "ancla_max": float(ventana["high"].max()),
         "ultima_fecha": df.index[-1].date().isoformat(),
     }
@@ -255,12 +266,33 @@ def filtrar_watchlist(met: pd.DataFrame) -> pd.DataFrame:
     ok = (
         (met.ret_1m > RET_1M_MIN) & (met.ret_3m > RET_3M_MIN) & (met.ret_6m > RET_6M_MIN)
         & (met.rank_3m >= 1 - RANK_TOP)                                 # momentum + ranking
-        & (met.precio > met.ema21) & (met.ema21 >= met.ema21_prev * 0.999)
+        & (met.precio > met.ema21) & (met.precio <= met.ema21 * (1 + MAX_EXT_EMA21))
+        & (met.ema21 >= met.ema21_prev * 0.999)
         & (met.ema9 >= met.ema9_prev * 0.995)                           # tendencia
         & met.higher_lows.astype(bool)
         & (met.atr_pct <= met.atr_pct_prev * ATR_CONTRACCION)           # compresión de volatilidad
+        & (met.ancla_sesiones >= ANCLA_MIN_SESIONES)                    # máximo previo => consolidación
     )
-    return met[ok].sort_values("ret_3m", ascending=False).head(MAX_WATCHLIST)
+    return met[ok].sort_values("ret_3m", ascending=False)
+
+
+def diversificar(cand: pd.DataFrame, diarias: dict) -> pd.DataFrame:
+    """Recorre los candidatos por ret_3m y descarta los que se mueven igual (corr > MAX_CORR)
+    que MAX_POR_GRUPO valores ya elegidos (mismo tema: refinerías, PLTR y sus ETFs...)."""
+    if cand.empty:
+        return cand
+    rets = pd.DataFrame({s: diarias[s]["close"].pct_change().tail(60) for s in cand.index})
+    corr = rets.corr()
+    elegidos = []
+    for s in cand.index:
+        similares = [e for e in elegidos if corr.loc[s, e] > MAX_CORR]
+        if len(similares) >= MAX_POR_GRUPO:
+            log(f"↪️ {s} descartado por tema repetido (corr>{MAX_CORR} con {similares})")
+            continue
+        elegidos.append(s)
+        if len(elegidos) >= MAX_WATCHLIST:
+            break
+    return cand.loc[elegidos]
 
 
 def modo_screener(trading, data):
@@ -283,7 +315,7 @@ def modo_screener(trading, data):
             filas[s] = m
     met = pd.DataFrame.from_dict(filas, orient="index")
     log(f"Pasan liquidez: {len(met)} de {len(diarias)} con datos")
-    wl = filtrar_watchlist(met)
+    wl = diversificar(filtrar_watchlist(met), diarias)
     items = []
     for s, r in wl.iterrows():
         d = {"symbol": s}
@@ -298,8 +330,9 @@ def modo_screener(trading, data):
         "items": items}, indent=2, ensure_ascii=False))
     log(f"✅ Watchlist ({len(items)}): {[i['symbol'] for i in items]}")
     tabla = "\n".join(f"| {i['symbol']} | {i['ret_1m']:.0%} | {i['ret_3m']:.0%} | {i['ret_6m']:.0%} | "
-                      f"{i['ancla_fecha']} |" for i in items)
-    resumen_md("### Watchlist Luk\n| Ticker | 1M | 3M | 6M | Ancla AVWAP |\n|---|---|---|---|---|\n" + tabla)
+                      f"{i['dist_ema21']:.1%} | {i['ancla_fecha']} |" for i in items)
+    resumen_md("### Watchlist Luk\n| Ticker | 1M | 3M | 6M | Sobre EMA21 | Ancla AVWAP |\n"
+               "|---|---|---|---|---|---|\n" + tabla)
 
 
 # ============================================================================ 2) MONITOR
@@ -307,9 +340,9 @@ def cargar_watchlist(trading, data):
     if WATCHLIST_F.exists():
         wl = json.loads(WATCHLIST_F.read_text())
         edad = (ahora_ny() - datetime.fromisoformat(wl["generada"])).days
-        if edad <= 4 and wl["items"]:
+        if edad <= 4:                      # una lista vacía reciente también vale: hoy no hay setups
             return wl["items"]
-        log(f"Watchlist con {edad} días o vacía.")
+        log(f"Watchlist con {edad} días.")
     log("Regenero la watchlist antes de operar…")
     modo_screener(trading, data)
     if WATCHLIST_F.exists():
