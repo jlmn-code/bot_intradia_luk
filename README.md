@@ -39,6 +39,35 @@ En la automatización de la estrategia de **Martín Luk**, el cálculo del riesg
 
 ---
 
+### Via Claude
+
+Voy a revisar tus bots anteriores y las fuentes de Luk Martin para construir `bot_intradia_luk.py` y `bot_luk.yml` con el mismo estilo.
+
+Te he preparado `bot_intradia_luk.py` y `bot_luk.yml` con la estrategia de Luk de tus dos fuentes. No he podido probarlo contra Alpaca desde aquí. Solo probé la lógica con datos sintéticos (filtros, señal de entrada y tamaño de posición) y comprobé que el YAML es válido. Lo primero que verás en Actions es la primera ejecución real.
+
+**Dónde va cada archivo:** `bot_intradia_luk.py` en la raíz del repo y `bot_luk.yml` en `.github/workflows/`.
+
+**Qué hace**
+- **Screener (16:35 NY):** descarta el mercado ilíquido (volumen medio de 20 sesiones > 500k y precio ≥ 5 $) y exige momentum (+15 % a 1 mes, +30 % a 3 y 6 meses, entre el 30 % mejor a 3 meses). Pide además tendencia (precio sobre la EMA21 con pendiente no negativa), mínimos crecientes y ATR en contracción. Guarda de 5 a 15 tickers en `datos/watchlist_luk.json`.
+- **Monitor (9:35 a 11:00 NY):** como soporte usa el AVWAP anclado al máximo de las últimas 20 sesiones y la EMA21. Compra cuando una vela de 5 min toca el soporte y la siguiente cierra por encima del máximo de la anterior. Si no hay watchlist reciente, la genera antes de operar.
+- **Orden y riesgo:** arriesga el 0,5 % del capital por operación y descarta stops a más del 3 %. Envía dos órdenes bracket con el mismo stop, una con la mitad de las acciones y toma de beneficios a 3R y otra con el resto a 5R. En vez de la cadena de bloques de tu documento, el tamaño lo calcula una clase `PosicionLuk` con ese mismo estilo (capital → riesgo → filtro → tamaño → órdenes).
+- **Cierre (15:40 y 15:52 NY):** liquida lo que el bot abrió ese día. Con `MANTENER_NOCHE=true` deja las posiciones abiertas.
+- **Seguridad:** `DRY_RUN` está en `true` por defecto, así que no envía órdenes hasta que crees la variable `DRY_RUN=false` en el repo. Solo funciona con cuenta paper.
+- **Ejecución a mano:** en "Run workflow" puedes elegir el modo (`screener`, `monitor`, `cierre` o `resumen`).
+
+**Pasos para ponerlo en marcha**
+1. Crea los secretos `API_KEY_LUK` y `SECRET_KEY_LUK`. Si no existen, usa `APCA_API_KEY_ID` y `APCA_API_SECRET_KEY`.
+2. Lanza primero `screener` a mano y luego `monitor` con DRY_RUN en `true`.
+3. Si ves el error 401 de Alpaca, renueva esos secretos.
+
+**Cosas que debes saber**
+- **No incluye backtest.** Tus backtests anteriores (intradía y ORB) no superaban al azar, y esta estrategia tampoco está validada. Lo razonable es dejarla unos días en DRY_RUN y mirar `datos/operaciones_luk.csv`.
+- **Minutos de Actions:** el monitor corre unos 80 minutos al día, lo que suma unos 1.700 al mes. Si el repo es privado y ya tienes otros bots, puedes quedarte sin los 2.000 minutos gratuitos. Para gastar menos, baja `ENTRADA_HASTA` o haz el repo público.
+- **Datos:** el screener usa el feed SIP, con 16 minutos de retraso. El monitor usa IEX en tiempo real, así que el AVWAP sale de volumen IEX (aproximado).
+- **Código del documento:** la comprobación de mínimos crecientes tenía un error (`minimos_recientes.iloc` sin índice) y la sustituí por una comparación de tres bloques de 5 sesiones.
+- **Interpretaciones mías:** el documento no define "contracción del ATR", la tolerancia de "toca el soporte" ni la ventana horaria de entradas. Puse el ATR% actual ≤ 95 % del de hace 10 sesiones, un toque de hasta 0,3 % sobre el nivel y entradas hasta las 11:00 NY. Todo se cambia con variables de entorno.
+- **Cierre del día:** por defecto es intradía puro, con órdenes DAY y cierre antes de las 16:00. Luk original mantiene las posiciones varios días.
+
 ### Código en Python (Estilo *Method Chaining* / Pipeline)
 
 A continuación se muestra cómo implementar esta lógica encadenando métodos directamente en una sola llamada secuencial:
