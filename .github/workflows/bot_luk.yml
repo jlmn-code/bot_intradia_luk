@@ -1,1 +1,98 @@
+name: Bot Luk (intradía)
 
+# Horarios en UTC. Cada hora NY tiene su cron de verano (EDT, UTC-4) y de invierno (EST, UTC-5);
+# el script comprueba la hora de Nueva York y se sale si la franja no corresponde.
+on:
+  schedule:
+    # screener, 16:35 NY
+    - cron: '35 20 * * 1-5'
+    - cron: '35 21 * * 1-5'
+    # monitor, 9:35 NY (+ respaldo a las 9:50 por si GitHub retrasa o pierde el primero)
+    - cron: '35 13 * * 1-5'
+    - cron: '35 14 * * 1-5'
+    - cron: '50 13 * * 1-5'
+    - cron: '50 14 * * 1-5'
+    # cierre, 15:40 y 15:52 NY
+    - cron: '40 19 * * 1-5'
+    - cron: '40 20 * * 1-5'
+    - cron: '52 19 * * 1-5'
+    - cron: '52 20 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      modo:
+        description: 'Modo a ejecutar'
+        type: choice
+        default: resumen
+        options: [screener, monitor, cierre, resumen]
+      dry_run:
+        description: 'DRY_RUN (auto = usa la variable del repo, por defecto true)'
+        type: choice
+        default: auto
+        options: [auto, 'true', 'false']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bot-luk
+  cancel-in-progress: false
+
+jobs:
+  bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    env:
+      # Secretos propios del bot Luk; si no existen, usa los genéricos APCA_*
+      APCA_API_KEY_ID: ${{ secrets.API_KEY_LUK || secrets.APCA_API_KEY_ID }}
+      APCA_API_SECRET_KEY: ${{ secrets.SECRET_KEY_LUK || secrets.APCA_API_SECRET_KEY }}
+      DRY_RUN: ${{ vars.DRY_RUN || 'true' }}
+      DRY_RUN_MANUAL: ${{ github.event.inputs.dry_run || 'auto' }}
+      PAPER: 'true'
+      PROGRAMADO: ${{ github.event_name == 'schedule' && 'true' || 'false' }}
+      SCHED: ${{ github.event.schedule }}
+      MODO_MANUAL: ${{ github.event.inputs.modo }}
+      # Parámetros opcionales (descomenta para cambiarlos)
+      # RIESGO_PCT: '0.005'
+      # ENTRADA_HASTA: '11:00'
+      # MANTENER_NOCHE: 'false'
+      # FEED_DIARIO: 'sip'
+      # FEED_INTRA: 'iex'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependencias
+        run: pip install alpaca-py pandas numpy
+
+      - name: Elegir modo
+        run: |
+          if [ -n "$MODO_MANUAL" ]; then
+            MODO="$MODO_MANUAL"
+          else
+            case "$SCHED" in
+              "35 20 * * 1-5"|"35 21 * * 1-5") MODO=screener ;;
+              "35 13 * * 1-5"|"35 14 * * 1-5"|"50 13 * * 1-5"|"50 14 * * 1-5") MODO=monitor ;;
+              "40 19 * * 1-5"|"40 20 * * 1-5"|"52 19 * * 1-5"|"52 20 * * 1-5") MODO=cierre ;;
+              *) echo "Cron desconocido: $SCHED"; exit 1 ;;
+            esac
+          fi
+          echo "MODO=$MODO" >> "$GITHUB_ENV"
+          echo "Hora NY ahora: $(TZ=America/New_York date '+%F %H:%M')  ->  modo $MODO"
+
+      - name: Ejecutar bot
+        run: python bot_intradia_luk.py "$MODO"
+
+      - name: Guardar datos en el repo
+        if: always()
+        run: |
+          git config user.name "bot-luk"
+          git config user.email "bot-luk@users.noreply.github.com"
+          git add datos 2>/dev/null || true
+          if ! git diff --cached --quiet; then
+            git commit -m "datos bot_luk ($MODO) $(date -u +%F)"
+            git pull --rebase --autostash || true
+            git push || echo "No se pudo hacer push de datos"
+          fi
