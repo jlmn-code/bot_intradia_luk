@@ -625,6 +625,8 @@ BT_SESIONES = _i("BT_SESIONES", 100)
 BT_COSTE = _f("BT_COSTE", 0.001)            # coste ida y vuelta (0,10 % del precio)
 BT_AZAR = _i("BT_AZAR", 20)                 # entradas aleatorias de control por cada operación real
 HORA_SALIDA = dtime(15, 45)                 # última vela usada para liquidar al final del día
+BT_MULTIDIA = _b("BT_MULTIDIA", False)      # True = mantener posiciones varios días (versión Luk original)
+BT_MAX_DIAS = _i("BT_MAX_DIAS", 10)         # máx. sesiones en posición (multidía)
 
 
 def a_dia(bars, d: date):
@@ -662,6 +664,51 @@ def simular_salida(dia, j0: int, entry: float, stop: float) -> float:
     return 0.5 * res[0] + 0.5 * res[1]
 
 
+def simular_multi(bars, ts0, entry, stop, ema9):
+    """Versión multidía: stop fijo; 50 % sale a R_TP1, el otro 50 % a R_TP2 o, una vez cobrado el primer
+    objetivo, si una sesión cierra bajo la EMA9 diaria; todo sale tras BT_MAX_DIAS sesiones.
+    Devuelve (R medio, fecha de salida, sesiones en posición). Si caben stop y TP en una vela, gana el stop."""
+    r = entry - stop
+    tp = [entry + R_TP1 * r, entry + R_TP2 * r]
+    x = bars[bars.index >= ts0].between_time("09:30", "15:59")
+    if x.empty:
+        return 0.0, ts0.date(), 1
+    O, H, L, C = (x[c].to_numpy() for c in ("open", "high", "low", "close"))
+    fechas = x.index.date
+    res = [None, None]
+    dia_n, k_fin = 0, len(x) - 1
+
+    def cerrar(px):
+        for j in (0, 1):
+            if res[j] is None:
+                res[j] = (px - entry) / r
+
+    for k in range(len(x)):
+        nuevo_dia = k == 0 or fechas[k] != fechas[k - 1]
+        if nuevo_dia and k > 0:                          # revisar el cierre de la sesión anterior
+            e9 = ema9.get(pd.Timestamp(fechas[k - 1])) if ema9 is not None else None
+            if dia_n >= BT_MAX_DIAS or (res[0] is not None and res[1] is None
+                                        and e9 is not None and C[k - 1] < e9):
+                cerrar(C[k - 1])
+                k_fin = k - 1
+                break
+        if nuevo_dia:
+            dia_n += 1
+        if L[k] <= stop:
+            cerrar(min(stop, O[k]))                      # con hueco a la baja se ejecuta en la apertura
+            k_fin = k
+            break
+        if res[0] is None and H[k] >= tp[0]:
+            res[0] = R_TP1
+        if res[1] is None and H[k] >= tp[1]:
+            res[1] = R_TP2
+        if None not in res:
+            k_fin = k
+            break
+    cerrar(C[k_fin])                                      # fin de datos o último día
+    return 0.5 * res[0] + 0.5 * res[1], fechas[k_fin], dia_n
+
+
 def tamano_pct(entry, stop) -> float:
     """% de capital arriesgado, con el tope de tamaño de posición del bot real."""
     return min(RIESGO_PCT, MAX_POSICION_PCT * (entry - stop) / entry)
@@ -690,11 +737,20 @@ def watchlists_historicas(diarias: dict, fechas) -> dict:
     return out
 
 
-def operar_dia(d, items, intra: dict, rng, n_azar: int):
+def operar_dia(d, items, intra: dict, rng, n_azar: int, ema9s=None, bloqueados=(), cupo=None):
     """Reproduce el monitor de una sesión. Devuelve lista de operaciones (y control aleatorio)."""
     ops = []
+    cupo = MAX_POSICIONES if cupo is None else cupo
+
+    def salida(bars, dia, j, entry, stop, s):
+        if BT_MULTIDIA:
+            return simular_multi(bars, dia.index[j], entry, stop, (ema9s or {}).get(s))
+        return simular_salida(dia, j, entry, stop), d.date(), 1
+
     for it in items:
         s = it["symbol"]
+        if s in bloqueados:
+            continue
         bars = intra.get(s)
         if bars is None or bars.empty:
             continue
@@ -716,23 +772,24 @@ def operar_dia(d, items, intra: dict, rng, n_azar: int):
             dist = (entry - stop) / entry
             if entry <= stop or dist > MAX_RIESGO_DIST or dist < MIN_RIESGO_DIST:
                 continue
-            r_bruta = simular_salida(dia, i + 1, entry, stop)
+            r_bruta, f_sal, n_dias = salida(bars, dia, i + 1, entry, stop, s)
             coste_r = BT_COSTE * entry / (entry - stop)
             azar = []
             for _ in range(n_azar):                     # control: misma acción y día, hora aleatoria, mismo stop %
                 jj = int(rng.choice(validos_all(dia)))
                 e2 = float(dia.open.iloc[jj + 1])
                 s2 = e2 * (1 - dist)
-                azar.append(simular_salida(dia, jj + 1, e2, s2) - BT_COSTE * e2 / (e2 - s2))
+                azar.append(salida(bars, dia, jj + 1, e2, s2, s)[0] - BT_COSTE * e2 / (e2 - s2))
             ops.append({"fecha": d.date().isoformat(), "symbol": s, "hora": dia.index[i + 1].strftime("%H:%M"),
                         "nivel": sen["nivel_nombre"], "entrada": round(entry, 2), "stop": round(stop, 2),
+                        "salida": f_sal.isoformat(), "dias": n_dias,
                         "dist_stop": round(dist, 4), "R": round(r_bruta - coste_r, 3),
                         "R_sin_coste": round(r_bruta, 3),
                         "pnl_pct": round(tamano_pct(entry, stop) * (r_bruta - coste_r), 5),
                         "R_azar": round(float(np.mean(azar)), 3) if azar else np.nan})
             break                                        # una entrada por símbolo y día
     ops.sort(key=lambda o: o["hora"])
-    return ops[:MAX_POSICIONES]
+    return ops[:max(0, cupo)]
 
 
 def validos_all(dia):
@@ -751,6 +808,9 @@ def resumen_backtest(ops: pd.DataFrame, dias_lista: int, dias_total: int, cand_t
     pos, neg = r[r > 0].sum(), -r[r < 0].sum()
     curva = ops.sort_values(["fecha", "hora"])["pnl_pct"].cumsum()
     dd = (curva - curva.cummax()).min()
+    modo_txt = (f"multidía (máx. {BT_MAX_DIAS} sesiones, trailing EMA9 tras el 1.º objetivo) · "
+                f"sesiones medias en posición: {ops['dias'].mean():.1f}") if BT_MULTIDIA else "intradía (cierre 15:45 NY)"
+    lin.append(f"Modo: {modo_txt}")
     lin += [f"Acierto: {(r > 0).mean():.0%} · R medio: {r.mean():+.3f} (±{se:.3f}) · "
             f"R medio sin coste: {ops['R_sin_coste'].mean():+.3f}",
             f"Profit factor: {pos / neg if neg > 0 else float('inf'):.2f} · "
@@ -790,8 +850,10 @@ def modo_backtest(trading, data):
     for d, items in wls.items():
         for it in items:
             a = date.fromisoformat(it["ancla_fecha"])
-            lo, hi = rangos.get(it["symbol"], (a, d.date()))
-            rangos[it["symbol"]] = (min(lo, a), max(hi, d.date()))
+            fin = d.date() + timedelta(days=int(BT_MAX_DIAS * 1.6) + 4) if BT_MULTIDIA else d.date()
+            fin = min(fin, hoy - timedelta(days=1))
+            lo, hi = rangos.get(it["symbol"], (a, fin))
+            rangos[it["symbol"]] = (min(lo, a), max(hi, fin))
     tf5 = TimeFrame(5, TimeFrameUnit.Minute)
     intra = {}
     for n, (s, (lo, hi)) in enumerate(rangos.items(), 1):
@@ -807,15 +869,22 @@ def modo_backtest(trading, data):
         time.sleep(0.3)
 
     rng = np.random.default_rng(42)
-    ops = []
+    ema9s = {s: diarias[s]["close"].ewm(span=9, adjust=False).mean() for s in rangos if s in diarias}
+    ops, abiertas = [], []
     for d in fechas:
-        if wls[d]:
-            ops += operar_dia(d, wls[d], intra, rng, BT_AZAR)
+        vigentes = [a for a in abiertas if a[1] >= d.date()]      # posiciones aún abiertas al empezar el día
+        cupo = MAX_POSICIONES - len(vigentes)
+        if wls[d] and cupo > 0:
+            nuevas = operar_dia(d, wls[d], intra, rng, BT_AZAR, ema9s, {a[0] for a in vigentes}, cupo)
+            ops += nuevas
+            vigentes += [(o["symbol"], date.fromisoformat(o["salida"])) for o in nuevas]
+        abiertas = vigentes
     df = pd.DataFrame(ops)
     DATOS.mkdir(parents=True, exist_ok=True)
-    df.to_csv(DATOS / "backtest_luk_operaciones.csv", index=False)
+    suf = "_multidia" if BT_MULTIDIA else ""
+    df.to_csv(DATOS / f"backtest_luk{suf}_operaciones.csv", index=False)
     texto = resumen_backtest(df, dias_lista, len(fechas), cand_total)
-    (DATOS / "backtest_luk_resumen.txt").write_text(texto)
+    (DATOS / f"backtest_luk{suf}_resumen.txt").write_text(texto)
     log("\n" + texto)
     resumen_md("### Backtest Luk\n```\n" + texto + "\n```")
     if not df.empty:
