@@ -33,6 +33,14 @@ on:
       max_ext:
         description: 'MAX_EXT_EMA21 (screener; 0.08 = 8 % sobre la EMA21)'
         default: '0.08'
+      multidia:
+        description: 'Backtest multidía (mantener posiciones varios días, trailing EMA9)'
+        type: choice
+        default: 'false'
+        options: ['false', 'true']
+      max_dias:
+        description: 'Backtest multidía: máx. sesiones en posición'
+        default: '10'
       dry_run:
         description: 'DRY_RUN (auto = usa la variable del repo, por defecto true)'
         type: choice
@@ -66,6 +74,8 @@ jobs:
       BT_SESIONES: ${{ github.event.inputs.bt_sesiones || '100' }}
       ANCLA_MIN_SESIONES: ${{ github.event.inputs.ancla_min || '5' }}
       MAX_EXT_EMA21: ${{ github.event.inputs.max_ext || '0.08' }}
+      BT_MULTIDIA: ${{ github.event.inputs.multidia || 'false' }}
+      BT_MAX_DIAS: ${{ github.event.inputs.max_dias || '10' }}
       # Parámetros opcionales (descomenta para cambiarlos)
       # RIESGO_PCT: '0.005'
       # MANTENER_NOCHE: 'false'
