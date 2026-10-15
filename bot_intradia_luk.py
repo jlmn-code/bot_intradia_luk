@@ -2,7 +2,7 @@
 """
 bot_intradia_luk.py  -  Estrategia de Martín Luk automatizada sobre Alpaca (paper)
 
-Cuatro modos (variable MODO o primer argumento):
+Cinco modos (variable MODO o primer argumento):
   screener : tras el cierre. Filtra el mercado (liquidez -> momentum -> tendencia ->
              compresión de volatilidad) y guarda datos/watchlist_luk.json (5-15 tickers).
   monitor  : durante la apertura. Para cada ticker de la watchlist calcula AVWAP anclado
@@ -11,6 +11,8 @@ Cuatro modos (variable MODO o primer argumento):
              (stop + toma de beneficios 50 % en 3R y 50 % en 5R).
   cierre   : antes del cierre liquida las posiciones abiertas por el bot (salvo MANTENER_NOCHE).
   resumen  : imprime cuenta, posiciones y operaciones del día.
+  backtest : (solo manual) reproduce las últimas BT_SESIONES sesiones: screener histórico + monitor
+             sobre velas de 5 min, con costes y comparación con entradas al azar.
 
 Seguridad: DRY_RUN=true por defecto (no envía órdenes). Solo cuenta paper.
 Todo se configura con variables de entorno (ver bloque CONFIG).
@@ -276,7 +278,7 @@ def filtrar_watchlist(met: pd.DataFrame) -> pd.DataFrame:
     return met[ok].sort_values("ret_3m", ascending=False)
 
 
-def diversificar(cand: pd.DataFrame, diarias: dict) -> pd.DataFrame:
+def diversificar(cand: pd.DataFrame, diarias: dict, verbose=True) -> pd.DataFrame:
     """Recorre los candidatos por ret_3m y descarta los que se mueven igual (corr > MAX_CORR)
     que MAX_POR_GRUPO valores ya elegidos (mismo tema: refinerías, PLTR y sus ETFs...)."""
     if cand.empty:
@@ -287,12 +289,24 @@ def diversificar(cand: pd.DataFrame, diarias: dict) -> pd.DataFrame:
     for s in cand.index:
         similares = [e for e in elegidos if corr.loc[s, e] > MAX_CORR]
         if len(similares) >= MAX_POR_GRUPO:
-            log(f"↪️ {s} descartado por tema repetido (corr>{MAX_CORR} con {similares})")
+            if verbose:
+                log(f"↪️ {s} descartado por tema repetido (corr>{MAX_CORR} con {similares})")
             continue
         elegidos.append(s)
         if len(elegidos) >= MAX_WATCHLIST:
             break
     return cand.loc[elegidos]
+
+
+def a_items(wl: pd.DataFrame) -> list:
+    items = []
+    for s, r in wl.iterrows():
+        d = {"symbol": s}
+        for k, v in r.items():
+            d[k] = bool(v) if isinstance(v, (np.bool_, bool)) else \
+                   float(v) if isinstance(v, (np.floating, float)) else v
+        items.append(d)
+    return items
 
 
 def modo_screener(trading, data):
@@ -316,13 +330,7 @@ def modo_screener(trading, data):
     met = pd.DataFrame.from_dict(filas, orient="index")
     log(f"Pasan liquidez: {len(met)} de {len(diarias)} con datos")
     wl = diversificar(filtrar_watchlist(met), diarias)
-    items = []
-    for s, r in wl.iterrows():
-        d = {"symbol": s}
-        for k, v in r.items():
-            d[k] = bool(v) if isinstance(v, (np.bool_, bool)) else \
-                   float(v) if isinstance(v, (np.floating, float)) else v
-        items.append(d)
+    items = a_items(wl)
     DATOS.mkdir(parents=True, exist_ok=True)
     WATCHLIST_F.write_text(json.dumps({
         "generada": ahora.isoformat(timespec="seconds"),
@@ -611,8 +619,211 @@ def modo_resumen(trading, data):
     resumen_md(f"### Resumen\nEquity **{float(c.equity):,.2f}** · entradas hoy: {list(e['entradas'])}")
 
 
+
+# ============================================================================ 5) BACKTEST
+BT_SESIONES = _i("BT_SESIONES", 100)
+BT_COSTE = _f("BT_COSTE", 0.001)            # coste ida y vuelta (0,10 % del precio)
+BT_AZAR = _i("BT_AZAR", 20)                 # entradas aleatorias de control por cada operación real
+HORA_SALIDA = dtime(15, 45)                 # última vela usada para liquidar al final del día
+
+
+def a_dia(bars, d: date):
+    return bars[bars.index.date == d].between_time("09:30", "15:59")
+
+
+def base_avwap(bars, ancla: date, d: date) -> dict:
+    x = bars[(bars.index.date >= ancla) & (bars.index.date < d)].between_time("09:30", "15:59")
+    tp = (x.high + x.low + x.close) / 3
+    return {"pv0": float((tp * x.volume).sum()), "v0": float(x.volume.sum())}
+
+
+def simular_salida(dia, j0: int, entry: float, stop: float) -> float:
+    """R medio de las dos mitades (TP 3R / TP 5R, mismo stop). Si en una vela caben stop y TP, gana el stop."""
+    r = entry - stop
+    tp = [entry + R_TP1 * r, entry + R_TP2 * r]
+    res = [None, None]
+    ult = None
+    for j in range(j0, len(dia)):
+        if dia.index[j].time() > HORA_SALIDA:
+            break
+        b = dia.iloc[j]
+        if b.low <= stop:
+            rs = (min(stop, b.open) - entry) / r
+            res = [x if x is not None else rs for x in res]
+            break
+        for k, nivel, rr in ((0, tp[0], R_TP1), (1, tp[1], R_TP2)):
+            if res[k] is None and b.high >= nivel:
+                res[k] = rr
+        ult = float(b.close)
+        if None not in res:
+            break
+    rs = ((ult if ult is not None else entry) - entry) / r
+    res = [x if x is not None else rs for x in res]
+    return 0.5 * res[0] + 0.5 * res[1]
+
+
+def tamano_pct(entry, stop) -> float:
+    """% de capital arriesgado, con el tope de tamaño de posición del bot real."""
+    return min(RIESGO_PCT, MAX_POSICION_PCT * (entry - stop) / entry)
+
+
+def watchlists_historicas(diarias: dict, fechas) -> dict:
+    """{fecha: [items]} reproduciendo el screener con datos estrictamente anteriores a cada fecha."""
+    out = {}
+    for n, d in enumerate(fechas, 1):
+        filas, cortes = {}, {}
+        for s, df in diarias.items():
+            pos = int(df.index.searchsorted(d))
+            if pos < MIN_HISTORIAL:
+                continue
+            m = metricas(df.iloc[max(0, pos - 145):pos])
+            if m:
+                filas[s], cortes[s] = m, pos
+        items = []
+        if filas:
+            cand = filtrar_watchlist(pd.DataFrame.from_dict(filas, orient="index"))
+            cortado = {s: diarias[s].iloc[:cortes[s]] for s in cand.index}
+            items = a_items(diversificar(cand, cortado, verbose=False))
+        out[d] = items
+        if n % 10 == 0:
+            log(f"  screener histórico {n}/{len(fechas)} sesiones")
+    return out
+
+
+def operar_dia(d, items, intra: dict, rng, n_azar: int):
+    """Reproduce el monitor de una sesión. Devuelve lista de operaciones (y control aleatorio)."""
+    ops = []
+    for it in items:
+        s = it["symbol"]
+        bars = intra.get(s)
+        if bars is None or bars.empty:
+            continue
+        dia = a_dia(bars, d.date())
+        if len(dia) < 8:
+            continue
+        base = base_avwap(bars, date.fromisoformat(it["ancla_fecha"]), d.date())
+        validos = []
+        for i in range(len(dia) - 1):
+            fin = dia.index[i] + pd.Timedelta(minutes=5)
+            if not (ENTRADA_DESDE <= fin.time() < ENTRADA_HASTA):
+                continue
+            validos.append(i)
+            sen = evaluar_senal(it, base, dia.iloc[:i + 1], fin)
+            if not sen:
+                continue
+            entry = float(dia.open.iloc[i + 1])        # la orden sale al cerrar la vela: entra en la apertura de la siguiente
+            stop = sen["stop"]
+            dist = (entry - stop) / entry
+            if entry <= stop or dist > MAX_RIESGO_DIST or dist < MIN_RIESGO_DIST:
+                continue
+            r_bruta = simular_salida(dia, i + 1, entry, stop)
+            coste_r = BT_COSTE * entry / (entry - stop)
+            azar = []
+            for _ in range(n_azar):                     # control: misma acción y día, hora aleatoria, mismo stop %
+                jj = int(rng.choice(validos_all(dia)))
+                e2 = float(dia.open.iloc[jj + 1])
+                s2 = e2 * (1 - dist)
+                azar.append(simular_salida(dia, jj + 1, e2, s2) - BT_COSTE * e2 / (e2 - s2))
+            ops.append({"fecha": d.date().isoformat(), "symbol": s, "hora": dia.index[i + 1].strftime("%H:%M"),
+                        "nivel": sen["nivel_nombre"], "entrada": round(entry, 2), "stop": round(stop, 2),
+                        "dist_stop": round(dist, 4), "R": round(r_bruta - coste_r, 3),
+                        "R_sin_coste": round(r_bruta, 3),
+                        "pnl_pct": round(tamano_pct(entry, stop) * (r_bruta - coste_r), 5),
+                        "R_azar": round(float(np.mean(azar)), 3) if azar else np.nan})
+            break                                        # una entrada por símbolo y día
+    ops.sort(key=lambda o: o["hora"])
+    return ops[:MAX_POSICIONES]
+
+
+def validos_all(dia):
+    return [i for i in range(len(dia) - 1)
+            if ENTRADA_DESDE <= (dia.index[i] + pd.Timedelta(minutes=5)).time() < ENTRADA_HASTA]
+
+
+def resumen_backtest(ops: pd.DataFrame, dias_lista: int, dias_total: int, cand_total: int) -> str:
+    lin = [f"Sesiones simuladas: {dias_total} · con watchlist no vacía: {dias_lista} "
+           f"· candidatos totales: {cand_total} · operaciones: {len(ops)}"]
+    if ops.empty:
+        lin.append("Sin operaciones: no hay base para valorar la estrategia en este periodo.")
+        return "\n".join(lin)
+    n, r = len(ops), ops["R"]
+    se = r.std(ddof=1) / math.sqrt(n) if n > 1 else float("nan")
+    pos, neg = r[r > 0].sum(), -r[r < 0].sum()
+    curva = ops.sort_values(["fecha", "hora"])["pnl_pct"].cumsum()
+    dd = (curva - curva.cummax()).min()
+    lin += [f"Acierto: {(r > 0).mean():.0%} · R medio: {r.mean():+.3f} (±{se:.3f}) · "
+            f"R medio sin coste: {ops['R_sin_coste'].mean():+.3f}",
+            f"Profit factor: {pos / neg if neg > 0 else float('inf'):.2f} · "
+            f"retorno aprox. (0,5 % riesgo, sin reinvertir): {curva.iloc[-1]:+.1%} · "
+            f"drawdown máx.: {dd:.1%}",
+            f"Control aleatorio (misma acción/día, hora al azar): R medio {ops['R_azar'].mean():+.3f} → "
+            f"diferencia {r.mean() - ops['R_azar'].mean():+.3f} (±{se:.3f})"]
+    if n < 30:
+        lin.append(f"⚠️ Solo {n} operaciones: demasiado pocas para concluir nada.")
+    return "\n".join(lin)
+
+
+def modo_backtest(trading, data):
+    if PROGRAMADO:
+        return log("El backtest solo se lanza a mano.")
+    hoy = ahora_ny().date()
+    syms = universo(trading)
+    dias = int(BT_SESIONES * 1.45) + 215
+    end = datetime.now(NY) - timedelta(minutes=16)
+    start = datetime.now(NY) - timedelta(days=dias)
+    log(f"Backtest de {BT_SESIONES} sesiones. Descargando {len(syms)} tickers ({FEED_DIARIO.value})…")
+    diarias = barras(data, syms, TimeFrame.Day, start, end, FEED_DIARIO)
+    diarias = {s: df[df.index.date < hoy] for s, df in diarias.items()}
+    # prefiltro de liquidez para acelerar (el filtro real se aplica cada día dentro de metricas)
+    diarias = {s: df for s, df in diarias.items() if len(df) >= MIN_HISTORIAL
+               and df["volume"].tail(BT_SESIONES + 20).median() >= VOL_MIN * 0.5 and df["close"].max() >= PRECIO_MIN}
+    log(f"Tras prefiltro de liquidez: {len(diarias)} tickers")
+    ref = max(diarias.values(), key=len)
+    fechas = list(ref.index[-BT_SESIONES:])
+    wls = watchlists_historicas(diarias, fechas)
+    dias_lista = sum(1 for v in wls.values() if v)
+    cand_total = sum(len(v) for v in wls.values())
+    log(f"Watchlists: {dias_lista} de {len(fechas)} sesiones con candidatos, {cand_total} candidatos en total")
+
+    # velas de 5 min (IEX) solo de los valores que llegaron a la watchlist
+    rangos = {}
+    for d, items in wls.items():
+        for it in items:
+            a = date.fromisoformat(it["ancla_fecha"])
+            lo, hi = rangos.get(it["symbol"], (a, d.date()))
+            rangos[it["symbol"]] = (min(lo, a), max(hi, d.date()))
+    tf5 = TimeFrame(5, TimeFrameUnit.Minute)
+    intra = {}
+    for n, (s, (lo, hi)) in enumerate(rangos.items(), 1):
+        try:
+            r = barras(data, [s], tf5, datetime.combine(lo, dtime(9, 30), tzinfo=NY),
+                       datetime.combine(hi + timedelta(days=1), dtime(0, 0), tzinfo=NY), FEED_INTRA, intra=True)
+            if s in r:
+                intra[s] = r[s]
+        except Exception as e:  # noqa: BLE001
+            log(f"⚠️ {s}: sin velas de 5 min ({e})")
+        if n % 20 == 0:
+            log(f"  velas de 5 min {n}/{len(rangos)}")
+        time.sleep(0.3)
+
+    rng = np.random.default_rng(42)
+    ops = []
+    for d in fechas:
+        if wls[d]:
+            ops += operar_dia(d, wls[d], intra, rng, BT_AZAR)
+    df = pd.DataFrame(ops)
+    DATOS.mkdir(parents=True, exist_ok=True)
+    df.to_csv(DATOS / "backtest_luk_operaciones.csv", index=False)
+    texto = resumen_backtest(df, dias_lista, len(fechas), cand_total)
+    (DATOS / "backtest_luk_resumen.txt").write_text(texto)
+    log("\n" + texto)
+    resumen_md("### Backtest Luk\n```\n" + texto + "\n```")
+    if not df.empty:
+        log("\n" + df.head(40).to_string(index=False))
+
+
 MODOS = {"screener": modo_screener, "monitor": modo_monitor,
-         "cierre": modo_cierre, "resumen": modo_resumen}
+         "cierre": modo_cierre, "resumen": modo_resumen, "backtest": modo_backtest}
 
 
 def main():
