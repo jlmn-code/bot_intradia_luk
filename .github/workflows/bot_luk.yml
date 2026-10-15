@@ -23,7 +23,16 @@ on:
         description: 'Modo a ejecutar'
         type: choice
         default: resumen
-        options: [screener, monitor, cierre, resumen]
+        options: [screener, monitor, cierre, resumen, backtest]
+      bt_sesiones:
+        description: 'Backtest: nº de sesiones a reproducir'
+        default: '100'
+      ancla_min:
+        description: 'ANCLA_MIN_SESIONES (screener; prueba 3 para menos filtro)'
+        default: '5'
+      max_ext:
+        description: 'MAX_EXT_EMA21 (screener; 0.08 = 8 % sobre la EMA21)'
+        default: '0.08'
       dry_run:
         description: 'DRY_RUN (auto = usa la variable del repo, por defecto true)'
         type: choice
@@ -40,7 +49,7 @@ concurrency:
 jobs:
   bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: ${{ github.event.inputs.modo == 'backtest' && 150 || 75 }}
     env:
       # Secretos propios del bot Luk; si no existen, usa los genéricos APCA_*
       APCA_API_KEY_ID: ${{ secrets.API_KEY_LUK || secrets.APCA_API_KEY_ID }}
@@ -54,6 +63,9 @@ jobs:
       # Hora NY hasta la que el monitor vigila entradas (cada minuto de más gasta minutos de Actions).
       # Se puede cambiar sin tocar el archivo: variable del repo ENTRADA_HASTA (p. ej. 10:15).
       ENTRADA_HASTA: ${{ vars.ENTRADA_HASTA || '10:30' }}
+      BT_SESIONES: ${{ github.event.inputs.bt_sesiones || '100' }}
+      ANCLA_MIN_SESIONES: ${{ github.event.inputs.ancla_min || '5' }}
+      MAX_EXT_EMA21: ${{ github.event.inputs.max_ext || '0.08' }}
       # Parámetros opcionales (descomenta para cambiarlos)
       # RIESGO_PCT: '0.005'
       # MANTENER_NOCHE: 'false'
