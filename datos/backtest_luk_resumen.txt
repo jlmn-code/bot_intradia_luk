@@ -1,4 +1,0 @@
-Sesiones simuladas: 100 · con watchlist no vacía: 81 · candidatos totales: 290 · operaciones: 51
-Acierto: 24% · R medio: -0.334 (±0.194) · R medio sin coste: -0.194
-Profit factor: 0.56 · retorno aprox. (0,5 % riesgo, sin reinvertir): -5.1% · drawdown máx.: -6.9%
-Control aleatorio (misma acción/día, hora al azar): R medio -0.284 → diferencia -0.050 (±0.194)
