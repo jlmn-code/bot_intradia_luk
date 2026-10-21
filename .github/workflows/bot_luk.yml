@@ -28,11 +28,11 @@ on:
         description: 'Backtest: nº de sesiones a reproducir'
         default: '100'
       ancla_min:
-        description: 'ANCLA_MIN_SESIONES (screener; prueba 3 para menos filtro)'
-        default: '5'
+        description: 'ANCLA_MIN_SESIONES (screener; 3 = menos filtro)'
+        default: '3'
       max_ext:
-        description: 'MAX_EXT_EMA21 (screener; 0.08 = 8 % sobre la EMA21)'
-        default: '0.08'
+        description: 'MAX_EXT_EMA21 (screener; 0.12 = 12 % sobre la EMA21)'
+        default: '0.12'
       multidia:
         description: 'Backtest multidía (mantener posiciones varios días, trailing EMA9)'
         type: choice
@@ -57,7 +57,8 @@ concurrency:
 jobs:
   bot:
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ github.event.inputs.modo == 'backtest' && 150 || 75 }}
+    # El monitor arranca a las 9:35 NY y vigila hasta ENTRADA_HASTA: con 75 min se cortaría a las 10:50.
+    timeout-minutes: ${{ github.event.inputs.modo == 'backtest' && 150 || 120 }}
     env:
       # Secretos propios del bot Luk; si no existen, usa los genéricos APCA_*
       APCA_API_KEY_ID: ${{ secrets.API_KEY_LUK || secrets.APCA_API_KEY_ID }}
@@ -70,12 +71,28 @@ jobs:
       MODO_MANUAL: ${{ github.event.inputs.modo }}
       # Hora NY hasta la que el monitor vigila entradas (cada minuto de más gasta minutos de Actions).
       # Se puede cambiar sin tocar el archivo: variable del repo ENTRADA_HASTA (p. ej. 10:15).
-      ENTRADA_HASTA: ${{ vars.ENTRADA_HASTA || '10:30' }}
+      ENTRADA_HASTA: ${{ vars.ENTRADA_HASTA || '11:00' }}
       BT_SESIONES: ${{ github.event.inputs.bt_sesiones || '100' }}
-      ANCLA_MIN_SESIONES: ${{ github.event.inputs.ancla_min || '5' }}
-      MAX_EXT_EMA21: ${{ github.event.inputs.max_ext || '0.08' }}
       BT_MULTIDIA: ${{ github.event.inputs.multidia || 'false' }}
       BT_MAX_DIAS: ${{ github.event.inputs.max_dias || '10' }}
+
+      # ---- Screener (relajado; valores originales de Luk entre paréntesis) ----
+      ANCLA_MIN_SESIONES: ${{ github.event.inputs.ancla_min || '3' }}    # (5)
+      MAX_EXT_EMA21: ${{ github.event.inputs.max_ext || '0.12' }}        # (0.08)
+      RET_1M_MIN: ${{ vars.RET_1M_MIN || '0.08' }}                       # (0.15)
+      RET_3M_MIN: ${{ vars.RET_3M_MIN || '0.20' }}                       # (0.30)
+      RET_6M_MIN: ${{ vars.RET_6M_MIN || '0.20' }}                       # (0.30)
+      RANK_TOP: ${{ vars.RANK_TOP || '0.40' }}                           # (0.30)
+      ATR_CONTRACCION: ${{ vars.ATR_CONTRACCION || '1.05' }}             # (0.95)
+      MAX_CORR: ${{ vars.MAX_CORR || '0.85' }}                           # (0.80)
+      MAX_POR_GRUPO: ${{ vars.MAX_POR_GRUPO || '3' }}                    # (2)
+
+      # ---- Señal intradía (relajada) ----
+      TOL_TOQUE: ${{ vars.TOL_TOQUE || '0.006' }}                        # (0.003)
+      LOOKBACK_VELAS: ${{ vars.LOOKBACK_VELAS || '5' }}                  # (3)
+      MAX_EXTENSION: ${{ vars.MAX_EXTENSION || '0.03' }}                 # (0.02)
+      MAX_RIESGO_DIST: ${{ vars.MAX_RIESGO_DIST || '0.04' }}             # (0.03)
+
       # Parámetros opcionales (descomenta para cambiarlos)
       # RIESGO_PCT: '0.005'
       # MANTENER_NOCHE: 'false'
